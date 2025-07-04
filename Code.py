@@ -277,14 +277,14 @@ class EnhancedHybridModel(nn.Module):
         self.transformer = AutoModel.from_pretrained(transformer_checkpoint)
         transformer_dim = self.transformer.config.hidden_size
 
-        # Mamba configuration - using MambaModel instead of MambaForCausalLM
+        # Mamba configuration
         self.mamba_config = MambaConfig(
             hidden_size=transformer_dim + self.handcrafted_dim,
             num_hidden_layers=4,
             intermediate_size=256,
         )
 
-        # Initialize base Mamba model without LM head
+        # Initialize base Mamba model
         self.mamba = MambaModel(self.mamba_config)
 
         # Custom classification head
