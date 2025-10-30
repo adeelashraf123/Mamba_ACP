@@ -1,4 +1,4 @@
-# "Mamba-ACP," an innovative hybrid deep learning framework for predicting anticancer peptides (ACPs) by integrating ESM-2 transformer embeddings, 
+# Mamba-ACP: A Hybrid State-Space and Transformer Framework for Interpretable Anticancer Peptide Prediction
 # handcrafted biochemical features (AAindex, BLOSUM62), and the Mamba state-space model.
 
 
