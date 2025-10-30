@@ -8,9 +8,12 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.utils import shuffle
 from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, matthews_corrcoef, \
     confusion_matrix, classification_report, roc_curve, auc
+# Update this import at the top of your file
+from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, matthews_corrcoef, \
+    confusion_matrix, classification_report, roc_curve, auc, roc_auc_score  # Add roc_auc_score here
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, \
     DataCollatorWithPadding
-# from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from transformers.integrations import is_tensorboard_available
 from transformers import TrainerCallback
 import shutil
@@ -29,6 +32,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap, to_rgba
 from scipy import stats
 import matplotlib as mpl
+from scipy.special import softmax
 
 
 random.seed(42)
@@ -277,14 +281,14 @@ class EnhancedHybridModel(nn.Module):
         self.transformer = AutoModel.from_pretrained(transformer_checkpoint)
         transformer_dim = self.transformer.config.hidden_size
 
-        # Mamba configuration
+        # Mamba configuration - using MambaModel instead of MambaForCausalLM
         self.mamba_config = MambaConfig(
             hidden_size=transformer_dim + self.handcrafted_dim,
             num_hidden_layers=4,
             intermediate_size=256,
         )
 
-        # Initialize base Mamba model
+        # Initialize base Mamba model without LM head
         self.mamba = MambaModel(self.mamba_config)
 
         # Custom classification head
@@ -381,14 +385,15 @@ class HybridDataCollator:
         return batch
 
 
-# Compute evaluation metrics (same as your original code)
+# Update the compute_metrics function
 def compute_metrics(eval_pred):
-    preds, labels = eval_pred
-    if preds.ndim > 1:  # If predictions are logits/probabilities
-        preds = np.argmax(preds, axis=1)
-    else:  # If predictions are already labels
-        preds = preds
+    logits, labels = eval_pred
+    # Convert logits to probabilities using softmax
+    probabilities = softmax(logits, axis=1)[:, 1]
 
+    preds = np.argmax(logits, axis=1)
+
+    # Calculate standard metrics
     accuracy = accuracy_score(labels, preds)
     precision = precision_score(labels, preds, zero_division=0)
     recall = recall_score(labels, preds, zero_division=0)
@@ -397,7 +402,10 @@ def compute_metrics(eval_pred):
     tn, fp, fn, tp = confusion_matrix(labels, preds).ravel()
     sensitivity = tp / (tp + fn)
     specificity = tn / (tn + fp)
-    fpr = fp / (fp + tn)  # False Positive Rate
+    fpr = fp / (fp + tn)
+
+    # Calculate AUC
+    auc_score = roc_auc_score(labels, probabilities)
 
     return {
         "eval_accuracy": accuracy,
@@ -407,7 +415,8 @@ def compute_metrics(eval_pred):
         "eval_mcc": mcc,
         "eval_sensitivity": sensitivity,
         "eval_specificity": specificity,
-        "eval_fpr": fpr,  # Add FPR to the metrics
+        "eval_fpr": fpr,
+        "eval_auc": auc_score,
     }
 
 
@@ -433,16 +442,19 @@ class CustomTrainer(Trainer):
 
 
 # Train the model
-def train_model(model, tokenizer, train_dataset, val_dataset):
-    data_collator = HybridDataCollator(tokenizer)  # Use our custom collator
-    batch_size = 8
+def train_model(model, tokenizer, train_dataset, val_dataset, fold_num=None):
+    # Create unique output directory for each fold
+    output_dir = f"/data1/adeel/Transformer/Output/fold_{fold_num}" if fold_num else "/data1/adeel/Transformer/Output/"
+
+    data_collator = HybridDataCollator(tokenizer)
+    batch_size = 16
 
     args = TrainingArguments(
-        output_dir="/data1/adeel/Transformer/Output/",
+        output_dir=output_dir,  # Use fold-specific directory
         eval_strategy='epoch',
         save_strategy='epoch',
-        num_train_epochs=5,  # Increased epochs for better MLP training
-        learning_rate=7e-5,  # Slightly lower learning rate
+        num_train_epochs=5,
+        learning_rate=7e-5,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         weight_decay=0.001,
@@ -455,8 +467,8 @@ def train_model(model, tokenizer, train_dataset, val_dataset):
         metric_for_best_model="eval_accuracy",
         lr_scheduler_type="cosine",
         greater_is_better=True,
-        max_grad_norm=1.0,  # Add gradient clipping
-        fp16=True,  # Enable mixed precision if using GPU
+        max_grad_norm=1.0,
+        fp16=True,
     )
 
     trainer = CustomTrainer(
@@ -464,11 +476,16 @@ def train_model(model, tokenizer, train_dataset, val_dataset):
         args=args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=data_collator,  # Use our custom collator
+        data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
 
     trainer.train()
+
+    # Save the final model
+    trainer.save_model(output_dir)
+    print(f"Model saved to {output_dir}")
+
     return trainer
 
 
@@ -482,16 +499,87 @@ def predict_model(trainer, dataset):
     return true_labels, predicted_labels, probabilities
 
 
+# Add this function to your code
+def plot_roc_curves(fold_results, overall_true_labels, overall_probabilities, save_path=None):
+    """
+    Plot ROC curves for each fold, average ROC, and overall ROC
+
+    Args:
+        fold_results: List of tuples (fold_num, true_labels, probabilities)
+        overall_true_labels: Combined true labels from all folds
+        overall_probabilities: Combined probabilities from all folds
+        save_path: Path to save the plot (optional)
+    """
+    plt.figure(figsize=(10, 8))
+
+    # Define a color palette with distinct colors
+    fold_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']  # Blue, Orange, Green, Red, Purple
+    average_color = '#2a52be'  # Distinct blue for average
+    overall_color = '#e377c2'  # Distinct pink/magenta for overall
+
+    # Store interpolated TPRs for average curve calculation
+    all_fpr = np.linspace(0, 1, 100)
+    interp_tprs = []
+    fold_aucs = []
+
+    # Plot individual folds with distinct colors
+    for i, (fold_num, true_labels, probabilities) in enumerate(fold_results):
+        fpr, tpr, _ = roc_curve(true_labels, probabilities)
+        fold_auc = auc(fpr, tpr)
+        fold_aucs.append(fold_auc)
+
+        # Interpolate to common FPR points for average curve
+        interp_tpr = np.interp(all_fpr, fpr, tpr)
+        interp_tpr[0] = 0.0
+        interp_tprs.append(interp_tpr)
+
+        # Plot individual fold curve
+        plt.plot(fpr, tpr, lw=1.5, alpha=0.7, color=fold_colors[i],
+                 label=f'Fold {fold_num} (AUC = {fold_auc:.4f})')
+
+    # Calculate and plot average ROC curve
+    mean_tpr = np.mean(interp_tprs, axis=0)
+    mean_tpr[-1] = 1.0
+    mean_auc = auc(all_fpr, mean_tpr)
+    plt.plot(all_fpr, mean_tpr, color=average_color, linestyle=':', lw=3,
+             label=f'Average (AUC = {mean_auc:.4f})', alpha=0.9)
+
+    # Calculate and plot overall ROC curve
+    overall_fpr, overall_tpr, _ = roc_curve(overall_true_labels, overall_probabilities)
+    overall_auc = auc(overall_fpr, overall_tpr)
+    plt.plot(overall_fpr, overall_tpr, color=overall_color, linestyle='-', lw=3,
+             label=f'Overall (AUC = {overall_auc:.4f})', alpha=0.9)
+
+    # Plot diagonal reference line
+    plt.plot([0, 1], [0, 1], color='gray', linestyle='--', lw=1)
+
+    # Format plot
+    plt.xlim([-0.01, 1.01])
+    plt.ylim([-0.01, 1.01])
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.title('(B) ROC Curves on Set 2', fontsize=14, fontweight='bold')
+
+    # Position legend to avoid overlapping curves
+    plt.legend(loc='lower right', fontsize=10)
+
+    # Add grid with subtle styling
+    plt.grid(True, alpha=0.3)
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+
+
 # Plot radar map - updated (same as your original code)
 def plot_radar_chart_with_mean_values(metrics_dict, avg_metrics, save_path=None):
-    """Shows all fold lines but only annotates mean values"""
+    """Radar chart with integrated metric names in value annotations"""
 
     def convert_to_pct(val):
         return val * 100 if val <= 1.0 else val
 
-    categories = ['precision', 'recall', 'f1', 'accuracy', 'specificity', 'sensitivity']
-    category_labels = ['Precision', 'Recall', 'F1 Score',
-                       'Accuracy', 'Specificity', 'Sensitivity']
+    categories = ['precision', 'recall', 'f1', 'accuracy', 'specificity', 'mcc']
+    category_labels = ['Precision', 'Recall', 'F1-Score', 'Accuracy', 'Specificity', 'MCC']
 
     labels = list(metrics_dict.keys())
     values = []
@@ -500,42 +588,63 @@ def plot_radar_chart_with_mean_values(metrics_dict, avg_metrics, save_path=None)
         values.append(fold_values)
 
     mean_values = [convert_to_pct(avg_metrics[f'eval_{cat}']) for cat in categories]
-
     num_vars = len(categories)
+
     angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
     angles += angles[:1]  # Close the loop
-
-    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
-
-    for idx, (label, vals) in enumerate(zip(labels, values)):
-        vals_wrapped = vals + [vals[0]]
-        ax.plot(angles, vals_wrapped, linewidth=1, alpha=0.4,
-                label=f'Fold {idx + 1}' if label.startswith('Fold') else label)
-
     mean_wrapped = mean_values + [mean_values[0]]
-    ax.plot(angles, mean_wrapped, linewidth=3, color='navy',
-            label='Mean', marker='o', markersize=8)
-    ax.fill(angles, mean_wrapped, color='navy', alpha=0.1)
 
+    plt.figure(figsize=(10, 10))
+    ax = plt.subplot(111, polar=True)
+
+    # Color scheme
+    fold_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']  # Distinct colors
+    mean_color = '#e377c2'  # Distinct magenta for mean
+
+    # Plot individual folds
+    for idx, vals in enumerate(values[:-1]):  # Exclude 'Average' entry
+        vals_wrapped = vals + [vals[0]]
+        ax.plot(angles, vals_wrapped, linewidth=2.0, alpha=0.7,
+                color=fold_colors[idx % len(fold_colors)],
+                label=f'Fold {idx + 1}')
+
+    # Highlight mean
+    ax.plot(angles, mean_wrapped, linewidth=4, color=mean_color,
+            label='Mean', marker='o', markersize=10, zorder=10)
+    ax.fill(angles, mean_wrapped, color=mean_color, alpha=0.15)
+
+    # Radial axis setup
     ax.set_ylim(0, 100)
     ax.set_yticks(np.arange(0, 101, 10))
-    ax.set_yticklabels([f"{y}%" for y in np.arange(0, 101, 10)])
+    ax.set_yticklabels([])
 
-    for angle, val, label in zip(angles[:-1], mean_values, category_labels):
-        ax.text(angle, val + 5, f"{val:.1f}%",
-                ha='center', va='center', fontsize=11,
-                bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+    # INTEGRATED ANNOTATIONS WITH METRIC NAMES
+    for angle, val, cat_label in zip(angles[:-1], mean_values, category_labels):
+        # Position text with metric name and value
+        ax.text(angle, 105, f"{cat_label}\n{val:.2f}%",
+                ha='center', va='center', fontsize=11, fontweight='bold',
+                color=mean_color,
+                bbox=dict(facecolor='white', alpha=0.95, boxstyle='round,pad=0.3',
+                          edgecolor=mean_color, linewidth=1))
 
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(category_labels, fontsize=12)
-    ax.set_title('Model Performance Metrics\n(Thin lines: Individual folds | Thick line: Mean)',
-                 pad=25, fontsize=14)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+    # Remove category labels completely
+    ax.set_xticklabels([])
+
+    # Title and legend
+    ax.set_title('(B) Performance Metrics on Set 2', pad=30, fontsize=16, fontweight='bold')
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.15),
+              ncol=3, frameon=True, fontsize=11)
+
+    # Grid styling
+    ax.grid(axis='y', linestyle='--', alpha=0.4)
+    ax.grid(axis='x', linestyle='-', alpha=0.8)
+    ax.spines['polar'].set_visible(False)
 
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', transparent=True)
     plt.show()
 
+# K-Fold Cross-Validation
 # K-Fold Cross-Validation
 def fold():
     # Load data
@@ -571,13 +680,14 @@ def fold():
     metrics_list = []
     all_true_labels = []
     all_probabilities = []
+    fold_results = []  # Will store (fold_num, true_labels, probabilities)
 
     for fold in range(1, n_folds + 1):
         print(f"Processing fold {fold}")
 
-        # Sample exactly 161 positive and 158 negative samples for validation
-        val_pos_samples = pos_data.sample(n=161, random_state=fold)
-        val_neg_samples = neg_data.sample(n=158, random_state=fold)
+        # Sample exactly 186 positive and 170 negative samples for validation
+        val_pos_samples = pos_data.sample(n=186, random_state=fold)
+        val_neg_samples = neg_data.sample(n=170, random_state=fold)
 
         # Combine to create the validation set
         val_data_fold = pd.concat([val_pos_samples, val_neg_samples])
@@ -617,7 +727,7 @@ def fold():
         )
 
         # Train model
-        trainer = train_model(model, tokenizer, train_dataset, val_dataset)
+        trainer = train_model(model, tokenizer, train_dataset, val_dataset, fold_num=fold)
 
         # Evaluate model
         eval_results = trainer.evaluate(val_dataset)
@@ -625,15 +735,30 @@ def fold():
 
         # Get predictions and probabilities for ROC curve
         true_labels, predicted_labels, probabilities = predict_model(trainer, val_dataset)
+        fold_results.append((fold, true_labels, probabilities))
         all_true_labels.extend(true_labels)
         all_probabilities.extend(probabilities)
 
     # Print average metrics across folds
     avg_metrics = {metric: np.mean([m[metric] for m in metrics_list]) for metric in metrics_list[0]}
-    print("Average Metrics Across Folds:")
-    print(avg_metrics)
+    print("\nAverage Metrics Across Folds:")
+    for metric, value in avg_metrics.items():
+        print(f"{metric}: {value:.4f}")
 
-    # Prepare metrics for radar chart
+    # Calculate overall AUC
+    overall_auc = roc_auc_score(all_true_labels, all_probabilities)
+    fold_aucs = [m['eval_auc'] for m in metrics_list]
+    avg_auc = np.mean(fold_aucs)
+
+    # Print AUC metrics
+    print("\nAUC Metrics:")
+    print(f"{'Fold':<10}{'AUC':<10}")
+    for i, auc_val in enumerate(fold_aucs):
+        print(f"Fold {i+1}:  {auc_val:.4f}")
+    print(f"\nAverage Fold AUC: {avg_auc:.4f}")
+    print(f"Overall AUC: {overall_auc:.4f}")
+
+    # Prepare metrics for radar chart with MCC instead of Sensitivity
     metrics_dict = {
         f'Fold {i + 1}': {
             'precision': m['eval_precision'],
@@ -641,7 +766,7 @@ def fold():
             'f1': m['eval_f1'],
             'accuracy': m['eval_accuracy'],
             'specificity': m['eval_specificity'],
-            'sensitivity': m['eval_sensitivity']
+            'mcc': m['eval_mcc']  # Changed from sensitivity to MCC
         } for i, m in enumerate(metrics_list)
     }
 
@@ -652,11 +777,12 @@ def fold():
         'f1': avg_metrics['eval_f1'],
         'accuracy': avg_metrics['eval_accuracy'],
         'specificity': avg_metrics['eval_specificity'],
-        'sensitivity': avg_metrics['eval_sensitivity']
+        'mcc': avg_metrics['eval_mcc']  # Changed from sensitivity to MCC
     }
 
     plot_radar_chart_with_mean_values(metrics_dict, avg_metrics, "radar_with_folds.png")
-
+    # Plot ROC curves
+    plot_roc_curves(fold_results, all_true_labels, all_probabilities, "roc_curves.png")
 
 if __name__ == "__main__":
     fold()
