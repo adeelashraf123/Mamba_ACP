@@ -454,10 +454,10 @@ def train_model(model, tokenizer, train_dataset, val_dataset, fold_num=None):
         eval_strategy='epoch',
         save_strategy='epoch',
         num_train_epochs=5,
-        learning_rate=7e-5,
+        learning_rate=1e-5,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
-        weight_decay=0.001,
+        weight_decay=0.01,
         warmup_ratio=0.1,
         logging_dir="./logs",
         logging_steps=2,
@@ -467,8 +467,8 @@ def train_model(model, tokenizer, train_dataset, val_dataset, fold_num=None):
         metric_for_best_model="eval_accuracy",
         lr_scheduler_type="cosine",
         greater_is_better=True,
-        max_grad_norm=1.0,
-        fp16=True,
+        # max_grad_norm=1.0,
+        # fp16=True,
     )
 
     trainer = CustomTrainer(
@@ -686,8 +686,8 @@ def fold():
         print(f"Processing fold {fold}")
 
         # Sample exactly 186 positive and 170 negative samples for validation
-        val_pos_samples = pos_data.sample(n=186, random_state=fold)
-        val_neg_samples = neg_data.sample(n=170, random_state=fold)
+       #  val_pos_samples = pos_data.sample(n=186, random_state=fold)
+       #  val_neg_samples = neg_data.sample(n=170, random_state=fold)
 
         # Combine to create the validation set
         val_data_fold = pd.concat([val_pos_samples, val_neg_samples])
